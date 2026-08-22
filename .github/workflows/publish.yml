@@ -1,0 +1,90 @@
+name: Publish RunPod Full SSH vLLM image
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: publish-runpod-full-ssh-vllm
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      # The vLLM base image is large. These SDKs are unrelated to this build and
+      # are removed only from GitHub's disposable runner before BuildKit starts.
+      - name: Free runner disk space
+        shell: bash
+        run: |
+          df -h /
+          sudo rm -rf -- \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /usr/local/lib/android \
+            /usr/share/dotnet
+          docker system prune --all --force
+          df -h /
+
+      - name: Select GHCR image name
+        id: image
+        shell: bash
+        run: |
+          image_name="ghcr.io/${GITHUB_REPOSITORY_OWNER}/private-ai-vllm"
+          printf 'name=%s\n' "${image_name,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate entrypoint
+        shell: bash
+        run: bash -n entrypoint.sh
+
+      - name: Log in to GHCR
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build and publish image
+        id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          pull: true
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:v0.26.0-full-ssh
+            ${{ steps.image.outputs.name }}:v0.26.0-full-ssh-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=v0.26.0-full-ssh
+
+      - name: Record published image
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            printf '### Published image\n\n'
+            printf 'Use this immutable reference in RunPod:\n\n'
+            printf '```text\n%s@%s\n```\n\nVersioned tag: `%s:v0.26.0-full-ssh`\n' \
+              "$IMAGE_NAME" "$IMAGE_DIGEST" "$IMAGE_NAME"
+          } >> "$GITHUB_STEP_SUMMARY"
