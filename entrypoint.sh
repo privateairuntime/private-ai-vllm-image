@@ -13,7 +13,7 @@ require_command() {
     || die "required container command is unavailable: $1"
 }
 
-for required_command in realpath ssh-keygen /usr/sbin/sshd vllm; do
+for required_command in realpath ssh-keygen stat /usr/sbin/sshd vllm; do
   require_command "$required_command"
 done
 
@@ -60,14 +60,14 @@ validate_vllm_arguments() {
 
 validate_vllm_arguments "$@"
 
-runtime_root=${RUNTIME_ROOT:-/workspace}
-[[ $runtime_root == /* ]] || die 'RUNTIME_ROOT must be an absolute path'
-[[ -d $runtime_root ]] || die 'RUNTIME_ROOT must already exist as a directory'
+verify_root_mode() {
+  local path=$1 expected_mode=$2 description=$3 actual
 
-runtime_root_real=$(realpath -e -- "$runtime_root") \
-  || die 'RUNTIME_ROOT could not be resolved'
-[[ $runtime_root_real != / ]] \
-  || die 'RUNTIME_ROOT must not resolve to the filesystem root'
+  actual=$(stat -c '%u:%a' -- "$path") \
+    || die "$description ownership and permissions could not be inspected"
+  [[ $actual == "0:$expected_mode" ]] \
+    || die "$description ownership or permissions are unsafe; expected uid:mode 0:$expected_mode, found $actual"
+}
 
 ensure_real_directory() {
   local directory=$1 mode=$2 resolved
@@ -82,23 +82,51 @@ ensure_real_directory() {
 
   chmod "$mode" -- "$directory" \
     || die 'could not secure an operator SSH directory'
+  verify_root_mode \
+    "$directory" "${mode#0}" 'an operator SSH directory'
   resolved=$(realpath -e -- "$directory") \
     || die 'an operator SSH directory could not be resolved'
   [[ $resolved == "$directory" ]] \
     || die 'an operator SSH directory resolved outside its expected path'
 }
 
-public_directory=$runtime_root_real/public
-operator_directory=$public_directory/operator
-host_key_directory=$operator_directory/ssh
+host_key_mode=${PRIVATE_AI_SSH_HOST_KEY_MODE:-ephemeral}
+case "$host_key_mode" in
+  ephemeral)
+    # Keep the active server identity away from provider volume filesystems
+    # that cannot enforce OpenSSH's required private-key mode. A container
+    # recreation intentionally generates a new fingerprint.
+    host_key_directory=/run/private-ai-ssh-host
+    ensure_real_directory "$host_key_directory" 0700
+    ;;
+  persistent)
+    runtime_root=${RUNTIME_ROOT:-/workspace}
+    [[ $runtime_root == /* ]] \
+      || die 'RUNTIME_ROOT must be an absolute path'
+    [[ -d $runtime_root ]] \
+      || die 'RUNTIME_ROOT must already exist as a directory'
 
-ensure_real_directory "$public_directory" 0755
-ensure_real_directory "$operator_directory" 0700
-ensure_real_directory "$host_key_directory" 0700
+    runtime_root_real=$(realpath -e -- "$runtime_root") \
+      || die 'RUNTIME_ROOT could not be resolved'
+    [[ $runtime_root_real != / ]] \
+      || die 'RUNTIME_ROOT must not resolve to the filesystem root'
 
-case "$host_key_directory/" in
-  "$runtime_root_real"/public/operator/ssh/) ;;
-  *) die 'operator SSH host-key path escaped RUNTIME_ROOT' ;;
+    public_directory=$runtime_root_real/public
+    operator_directory=$public_directory/operator
+    host_key_directory=$operator_directory/ssh
+
+    ensure_real_directory "$public_directory" 0755
+    ensure_real_directory "$operator_directory" 0700
+    ensure_real_directory "$host_key_directory" 0700
+
+    case "$host_key_directory/" in
+      "$runtime_root_real"/public/operator/ssh/) ;;
+      *) die 'operator SSH host-key path escaped RUNTIME_ROOT' ;;
+    esac
+    ;;
+  *)
+    die 'PRIVATE_AI_SSH_HOST_KEY_MODE must be ephemeral or persistent'
+    ;;
 esac
 
 host_key=$host_key_directory/ssh_host_ed25519_key
@@ -106,11 +134,12 @@ host_public_key=$host_key.pub
 
 if [[ -e $host_key || -L $host_key ]]; then
   [[ -f $host_key && ! -L $host_key ]] \
-    || die 'persistent SSH host key must be a regular, non-symlink file'
+    || die 'SSH host private key must be a regular, non-symlink file'
   chmod 0600 -- "$host_key" \
-    || die 'could not secure the persistent SSH host key'
+    || die 'could not secure the SSH host private key'
+  verify_root_mode "$host_key" 600 'the SSH host private key'
   ssh-keygen -y -f "$host_key" >/dev/null \
-    || die 'persistent SSH host key is invalid; refusing to replace it automatically'
+    || die 'SSH host private key is invalid; refusing to replace it automatically'
 else
   key_stage_directory=$(mktemp -d "$host_key_directory/.host-key-stage.XXXXXXXX") \
     || die 'could not create a host-key staging directory'
@@ -120,24 +149,30 @@ else
   trap cleanup_key_stage EXIT HUP INT TERM
 
   ssh-keygen -q -t ed25519 -N '' -f "$key_stage_directory/ssh_host_ed25519_key" \
-    || die 'could not generate the persistent SSH host key'
+    || die 'could not generate the SSH host private key'
   mv -- "$key_stage_directory/ssh_host_ed25519_key" "$host_key"
   mv -- "$key_stage_directory/ssh_host_ed25519_key.pub" "$host_public_key"
   chmod 0600 -- "$host_key"
   chmod 0644 -- "$host_public_key"
+  verify_root_mode "$host_key" 600 'the SSH host private key'
+  verify_root_mode "$host_public_key" 644 'the SSH host public key'
   cleanup_key_stage
   trap - EXIT HUP INT TERM
 fi
 
 if [[ -e $host_public_key || -L $host_public_key ]]; then
   [[ -f $host_public_key && ! -L $host_public_key ]] \
-    || die 'persistent SSH host public key must be a regular, non-symlink file'
+    || die 'SSH host public key must be a regular, non-symlink file'
+  chmod 0644 -- "$host_public_key" \
+    || die 'could not secure the SSH host public key'
+  verify_root_mode "$host_public_key" 644 'the SSH host public key'
 fi
 
 host_fingerprint=$(ssh-keygen -E sha256 -lf "$host_key" | awk 'NR == 1 {print $2}')
 [[ $host_fingerprint == SHA256:* ]] \
-  || die 'could not derive the persistent SSH host-key fingerprint'
-printf 'private-ai RunPod SSH host fingerprint=%s\n' "$host_fingerprint"
+  || die 'could not derive the SSH host-key fingerprint'
+printf 'private-ai RunPod SSH host-key mode=%s fingerprint=%s\n' \
+  "$host_key_mode" "$host_fingerprint"
 
 [[ -n ${PUBLIC_KEY:-} ]] \
   || die 'RunPod PUBLIC_KEY is empty; add an account SSH public key before deploying the Pod'
